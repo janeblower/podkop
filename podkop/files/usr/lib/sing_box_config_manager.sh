@@ -222,15 +222,17 @@ sing_box_cm_add_fakeip_dns_server() {
     local config="$1"
     local tag="$2"
     local inet4_range="$3"
+    local inet6_range="$4"
 
     echo "$config" | jq \
         --arg tag "$tag" \
         --arg inet4_range "$inet4_range" \
+        --arg inet6_range "$inet6_range" \
         '.dns.servers += [{
-			type: "fakeip",
-			tag: $tag,
-			inet4_range: $inet4_range,
-		}]'
+            type: "fakeip",
+            tag: $tag,
+            inet4_range: $inet4_range
+        } + (if $inet6_range != "" then { inet6_range: $inet6_range } else {} end)]'
 }
 
 #######################################

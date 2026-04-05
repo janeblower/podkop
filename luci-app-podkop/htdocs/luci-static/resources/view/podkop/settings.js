@@ -330,6 +330,15 @@ function createSettingsContent(section) {
   o.rmempty = false;
 
   o = section.option(
+    form.Flag,
+    "enable_ipv6",
+    _("Enable IPv6 Support"),
+    _("Enable IPv6 nft rules, routes and sing-box fakeip handling"),
+  );
+  o.default = "0";
+  o.rmempty = false;
+
+  o = section.option(
     form.ListValue,
     "config_path",
     _("Config File Path"),

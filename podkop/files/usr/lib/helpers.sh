@@ -8,7 +8,21 @@ is_ipv4() {
 # Check if string is valid IPv4 with CIDR mask
 is_ipv4_cidr() {
     local ip="$1"
-    local regex="^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}(\/(3[0-2]|2[0-9]|1[0-9]|[0-9]))$"
+    local regex="^((25[0-5]|(2[0-4]|1\\d|[1-9]|)\\d)\\.?\\b){4}(\\/(3[0-2]|2[0-9]|1[0-9]|[0-9]))$"
+    [[ "$ip" =~ $regex ]]
+}
+
+# Check if string is valid IPv6
+is_ipv6() {
+    local ip="$1"
+    local regex='^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}$'
+    [[ "$ip" =~ $regex ]]
+}
+
+# Check if string is valid IPv6 with CIDR mask
+is_ipv6_cidr() {
+    local ip="$1"
+    local regex='^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}\/(12[0-8]|1[0-1][0-9]|[1-9]?[0-9])$'
     [[ "$ip" =~ $regex ]]
 }
 
@@ -334,8 +348,8 @@ parse_domain_or_subnet_file_to_comma_string() {
             fi
             ;;
         subnets)
-            if ! is_ipv4 "$line" && ! is_ipv4_cidr "$line"; then
-                log "'$line' is not IPv4 or IPv4 CIDR" "debug"
+            if ! is_ipv4 "$line" && ! is_ipv4_cidr "$line" && ! is_ipv6 "$line" && ! is_ipv6_cidr "$line"; then
+                log "'$line' is not IPv4/IPv6 or CIDR" "debug"
                 continue
             fi
             ;;

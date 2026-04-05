@@ -13,6 +13,14 @@ nft_create_ipv4_set() {
     nft add set inet "$table" "$name" '{ type ipv4_addr; flags interval; auto-merge; }'
 }
 
+# Create a set within a table for storing IPv6 addresses
+nft_create_ipv6_set() {
+    local table="$1"
+    local name="$2"
+
+    nft add set inet "$table" "$name" '{ type ipv6_addr; flags interval; auto-merge; }'
+}
+
 nft_create_ifname_set() {
     local table="$1"
     local name="$2"
@@ -44,6 +52,46 @@ nft_add_set_elements_from_file_chunked() {
 
         if ! is_ipv4 "$line" && ! is_ipv4_cidr "$line"; then
             log "'$line' is not IPv4 or IPv4 CIDR" "debug"
+            continue
+        fi
+
+        if [ -z "$array" ]; then
+            array="$line"
+        else
+            array="$array,$line"
+        fi
+
+        count=$((count + 1))
+
+        if [ "$count" = "$chunk_size" ]; then
+            log "Adding $count elements to nft set $nft_set_name" "debug"
+            nft_add_set_elements "$nft_table_name" "$nft_set_name" "$array"
+            array=""
+            count=0
+        fi
+    done < "$filepath"
+
+    if [ -n "$array" ]; then
+        log "Adding $count elements to nft set $nft_set_name" "debug"
+        nft_add_set_elements "$nft_table_name" "$nft_set_name" "$array"
+    fi
+}
+
+nft_add_set_elements_from_file_chunked_v6() {
+    local filepath="$1"
+    local nft_table_name="$2"
+    local nft_set_name="$3"
+    local chunk_size="${4:-5000}"
+
+    local array count
+    count=0
+    while IFS= read -r line; do
+        line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        [ -z "$line" ] && continue
+
+        if ! is_ipv6 "$line" && ! is_ipv6_cidr "$line"; then
+            log "'$line' is not IPv6 or IPv6 CIDR" "debug"
             continue
         fi
 

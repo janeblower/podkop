@@ -172,6 +172,16 @@ stop_main() {
         ip route flush table "$RT_TABLE_NAME"
     fi
 
+    log "Flush ip6 rule"
+    if ip -6 rule list | grep -q "podkop"; then
+        ip -6 rule del fwmark "$NFT_FAKEIP_MARK"/"$NFT_FAKEIP_MARK" table "$RT_TABLE_NAME" priority 105
+    fi
+
+    log "Flush ip6 route"
+    if ip -6 route list table "$RT_TABLE_NAME" > /dev/null 2>&1; then
+        ip -6 route flush table "$RT_TABLE_NAME"
+    fi
+
     log "Stop sing-box"
     /etc/init.d/sing-box stop
 }
@@ -266,6 +276,24 @@ route_table_rule_mark() {
     else
         log "Marking rule exist" "debug"
     fi
+
+    local enable_ipv6
+    config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+    if [ "$enable_ipv6" -eq 1 ]; then
+        if ! ip -6 route list table "$RT_TABLE_NAME" 2> /dev/null | grep -q "local default dev lo scope host"; then
+            log "Added IPv6 route for tproxy" "debug"
+            ip -6 route add local ::/0 dev lo table "$RT_TABLE_NAME"
+        else
+            log "IPv6 route for tproxy exists" "debug"
+        fi
+
+        if ! ip -6 rule list | grep -q "from all fwmark $NFT_FAKEIP_MARK/$NFT_FAKEIP_MARK lookup $RT_TABLE_NAME"; then
+            log "Create IPv6 marking rule" "debug"
+            ip -6 rule add fwmark "$NFT_FAKEIP_MARK"/"$NFT_FAKEIP_MARK" table "$RT_TABLE_NAME" priority 105
+        else
+            log "IPv6 marking rule exist" "debug"
+        fi
+    fi
 }
 
 nft_init_interfaces_set() {
@@ -304,6 +332,30 @@ create_nft_rules() {
     log "Create common set"
     nft_create_ipv4_set "$NFT_TABLE_NAME" "$NFT_COMMON_SET_NAME"
 
+    local enable_ipv6
+    config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+    if [ "$enable_ipv6" -eq 1 ]; then
+        log "Create localv6 set"
+        nft_create_ipv6_set "$NFT_TABLE_NAME" "$NFT_LOCALV6_SET_NAME"
+        nft add element inet "$NFT_TABLE_NAME" localv6 '{
+            ::/128,
+            ::1/128,
+            ::ffff:0:0/96,
+            ::/96,
+            100::/64,
+            2001:10::/28,
+            2001:db8::/32,
+            3fff::/20,
+            fc00::/7,
+            fe80::/10,
+            fec0::/10,
+            ff00::/8
+        }'
+
+        log "Create common ipv6 set"
+        nft_create_ipv6_set "$NFT_TABLE_NAME" "$NFT_COMMON6_SET_NAME"
+    fi
+
     log "Create interface set"
     nft_init_interfaces_set
 
@@ -319,6 +371,22 @@ create_nft_rules() {
 
     nft add rule inet "$NFT_TABLE_NAME" proxy meta mark \& "$NFT_FAKEIP_MARK" == "$NFT_FAKEIP_MARK" meta l4proto tcp tproxy ip to 127.0.0.1:1602 counter
     nft add rule inet "$NFT_TABLE_NAME" proxy meta mark \& "$NFT_FAKEIP_MARK" == "$NFT_FAKEIP_MARK" meta l4proto udp tproxy ip to 127.0.0.1:1602 counter
+
+    if [ "$enable_ipv6" -eq 1 ]; then
+        nft add rule inet "$NFT_TABLE_NAME" mangle iifname "@${NFT_INTERFACE_SET_NAME}" ip6 daddr "@${NFT_COMMON6_SET_NAME}" meta l4proto tcp meta mark set "$NFT_FAKEIP_MARK" counter
+        nft add rule inet "$NFT_TABLE_NAME" mangle iifname "@${NFT_INTERFACE_SET_NAME}" ip6 daddr "@${NFT_COMMON6_SET_NAME}" meta l4proto udp meta mark set "$NFT_FAKEIP_MARK" counter
+        nft add rule inet "$NFT_TABLE_NAME" mangle iifname "@${NFT_INTERFACE_SET_NAME}" ip6 daddr "$SB_FAKEIP_INET6_RANGE" meta l4proto tcp meta mark set "$NFT_FAKEIP_MARK" counter
+        nft add rule inet "$NFT_TABLE_NAME" mangle iifname "@${NFT_INTERFACE_SET_NAME}" ip6 daddr "$SB_FAKEIP_INET6_RANGE" meta l4proto udp meta mark set "$NFT_FAKEIP_MARK" counter
+
+        nft add rule inet "$NFT_TABLE_NAME" proxy meta mark \& "$NFT_FAKEIP_MARK" == "$NFT_FAKEIP_MARK" meta l4proto tcp tproxy ip6 to [::1]:1602 counter
+        nft add rule inet "$NFT_TABLE_NAME" proxy meta mark \& "$NFT_FAKEIP_MARK" == "$NFT_FAKEIP_MARK" meta l4proto udp tproxy ip6 to [::1]:1602 counter
+
+        nft add rule inet "$NFT_TABLE_NAME" mangle_output ip6 daddr "@${NFT_LOCALV6_SET_NAME}" return
+        nft add rule inet "$NFT_TABLE_NAME" mangle_output ip6 daddr "@${NFT_COMMON6_SET_NAME}" meta l4proto tcp meta mark set "$NFT_FAKEIP_MARK" counter
+        nft add rule inet "$NFT_TABLE_NAME" mangle_output ip6 daddr "@${NFT_COMMON6_SET_NAME}" meta l4proto udp meta mark set "$NFT_FAKEIP_MARK" counter
+        nft add rule inet "$NFT_TABLE_NAME" mangle_output ip6 daddr "$SB_FAKEIP_INET6_RANGE" meta l4proto tcp meta mark set "$NFT_FAKEIP_MARK" counter
+        nft add rule inet "$NFT_TABLE_NAME" mangle_output ip6 daddr "$SB_FAKEIP_INET6_RANGE" meta l4proto udp meta mark set "$NFT_FAKEIP_MARK" counter
+    fi
 
     nft add rule inet "$NFT_TABLE_NAME" mangle_output ip daddr "@$NFT_LOCALV4_SET_NAME" return
     nft add rule inet "$NFT_TABLE_NAME" mangle_output meta mark "$NFT_OUTBOUND_MARK" counter return
@@ -601,10 +669,21 @@ sing_box_configure_log() {
 sing_box_configure_inbounds() {
     log "Configure the inbounds section of a sing-box JSON configuration"
 
+    local enable_ipv6
+    config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+
     config=$(
         sing_box_cm_add_tproxy_inbound \
             "$config" "$SB_TPROXY_INBOUND_TAG" "$SB_TPROXY_INBOUND_ADDRESS" "$SB_TPROXY_INBOUND_PORT" true true
     )
+    
+    if [ "$enable_ipv6" -eq 1 ]; then
+        config=$(
+            sing_box_cm_add_tproxy_inbound \
+                "$config" "$SB_TPROXY_INBOUND_TAG_IPv6" "$SB_TPROXY_INBOUND_ADDRESS_IPv6" "$SB_TPROXY_INBOUND_PORT" true true
+        )
+    fi
+
     config=$(
         sing_box_cm_add_direct_inbound "$config" "$SB_DNS_INBOUND_TAG" "$SB_DNS_INBOUND_ADDRESS" "$SB_DNS_INBOUND_PORT"
     )
@@ -763,7 +842,13 @@ configure_outbound_handler() {
 
 sing_box_configure_dns() {
     log "Configure the DNS section of a sing-box JSON configuration"
-    config=$(sing_box_cm_configure_dns "$config" "$SB_DNS_SERVER_TAG" "ipv4_only" true)
+    local dns_strategy="ipv4_only"
+    local enable_ipv6
+    config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+    if [ "$enable_ipv6" -eq 1 ]; then
+        dns_strategy="prefer_ipv4"
+    fi
+    config=$(sing_box_cm_configure_dns "$config" "$SB_DNS_SERVER_TAG" "$dns_strategy" true)
 
     log "Adding DNS Servers" "debug"
     local dns_type dns_server bootstrap_dns_server dns_domain_resolver dns_server_address
@@ -778,7 +863,14 @@ sing_box_configure_dns() {
 
     config=$(sing_box_cm_add_udp_dns_server "$config" "$SB_BOOTSTRAP_SERVER_TAG" "$bootstrap_dns_server" 53)
     config=$(sing_box_cf_add_dns_server "$config" "$dns_type" "$SB_DNS_SERVER_TAG" "$dns_server" "$dns_domain_resolver")
-    config=$(sing_box_cm_add_fakeip_dns_server "$config" "$SB_FAKEIP_DNS_SERVER_TAG" "$SB_FAKEIP_INET4_RANGE")
+
+    local enable_ipv6
+    config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+    if [ "$enable_ipv6" -eq 1 ]; then
+        config=$(sing_box_cm_add_fakeip_dns_server "$config" "$SB_FAKEIP_DNS_SERVER_TAG" "$SB_FAKEIP_INET4_RANGE" "$SB_FAKEIP_INET6_RANGE")
+    else
+        config=$(sing_box_cm_add_fakeip_dns_server "$config" "$SB_FAKEIP_DNS_SERVER_TAG" "$SB_FAKEIP_INET4_RANGE" "")
+    fi
 
     log "Adding DNS Rules"
     local rewrite_ttl service_domains
@@ -804,8 +896,16 @@ sing_box_configure_route() {
             "$output_network_interface")
     fi
 
+    local enable_ipv6
+    config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+
+    local tproxy_inbound_list="$SB_TPROXY_INBOUND_TAG"
+    if [ "$enable_ipv6" -eq 1 ]; then
+        tproxy_inbound_list="$tproxy_inbound_list,$SB_TPROXY_INBOUND_TAG_IPv6"
+    fi
+
     local sniff_inbounds
-    sniff_inbounds=$(comma_string_to_json_array "$SB_TPROXY_INBOUND_TAG,$SB_DNS_INBOUND_TAG")
+    sniff_inbounds=$(comma_string_to_json_array "$tproxy_inbound_list,$SB_DNS_INBOUND_TAG")
     config=$(sing_box_cm_sniff_route_rule "$config" "inbound" "$sniff_inbounds")
 
     config=$(sing_box_cm_add_hijack_dns_route_rule "$config" "protocol" "dns")
@@ -814,12 +914,18 @@ sing_box_configure_route() {
     config_get_bool disable_quic "settings" "disable_quic" 0
     if [ "$disable_quic" -eq 1 ]; then
         config=$(sing_box_cf_add_single_key_reject_rule "$config" "$SB_TPROXY_INBOUND_TAG" "protocol" "quic")
+        if [ "$enable_ipv6" -eq 1 ]; then
+            config=$(sing_box_cf_add_single_key_reject_rule "$config" "$SB_TPROXY_INBOUND_TAG_IPv6" "protocol" "quic")
+        fi
     fi
 
     local first_outbound_section
     first_outbound_section="$(get_first_outbound_section)"
     first_outbound_tag="$(get_outbound_tag_by_section "$first_outbound_section")"
     config=$(sing_box_cf_proxy_domain "$config" "$SB_TPROXY_INBOUND_TAG" "$CHECK_PROXY_IP_DOMAIN" "$first_outbound_tag")
+    if [ "$enable_ipv6" -eq 1 ]; then
+        config=$(sing_box_cf_proxy_domain "$config" "$SB_TPROXY_INBOUND_TAG_IPv6" "$CHECK_PROXY_IP_DOMAIN" "$first_outbound_tag")
+    fi
     config=$(sing_box_cf_override_domain_port "$config" "$FAKEIP_TEST_DOMAIN" 8443)
 
     configure_common_reject_route_rule
@@ -830,6 +936,9 @@ sing_box_configure_route() {
     if [ -n "$routing_excluded_ips" ]; then
         rule_tag="$(gen_id)"
         config=$(sing_box_cm_add_route_rule "$config" "$rule_tag" "$SB_TPROXY_INBOUND_TAG" "$SB_DIRECT_OUTBOUND_TAG")
+        if [ "$enable_ipv6" -eq 1 ]; then
+            config=$(sing_box_cm_add_route_rule "$config" "$rule_tag" "$SB_TPROXY_INBOUND_TAG_IPv6" "$SB_DIRECT_OUTBOUND_TAG")
+        fi
         config_list_foreach "settings" "routing_excluded_ips" exclude_source_ip_from_routing_handler "$rule_tag"
     fi
 
@@ -849,6 +958,12 @@ include_source_ips_in_routing_handler() {
             sing_box_cm_add_route_rule \
                 "$config" "$rule_tag" "$SB_TPROXY_INBOUND_TAG" "$(get_outbound_tag_by_section "$section")"
         )
+        if [ "$enable_ipv6" -eq 1 ]; then
+            config=$(
+                sing_box_cm_add_route_rule \
+                    "$config" "$rule_tag" "$SB_TPROXY_INBOUND_TAG_IPv6" "$(get_outbound_tag_by_section "$section")"
+            )
+        fi
         config_list_foreach "$section" "fully_routed_ips" include_source_ip_in_routing_handler "$rule_tag"
     fi
 }
@@ -867,6 +982,11 @@ configure_common_reject_route_rule() {
         done
         if [ "$block_section_lists_enabled" -eq 1 ]; then
             config=$(sing_box_cm_add_reject_route_rule "$config" "$SB_REJECT_RULE_TAG" "$SB_TPROXY_INBOUND_TAG")
+            local enable_ipv6
+            config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+            if [ "$enable_ipv6" -eq 1 ]; then
+                config=$(sing_box_cm_add_reject_route_rule "$config" "$SB_REJECT_RULE_TAG" "$SB_TPROXY_INBOUND_TAG_IPv6")
+            fi
         else
             log "Block sections does not have any enabled list, reject rule is not required" "warn"
         fi
@@ -888,6 +1008,12 @@ configure_common_direct_route_rule() {
         if [ "$exclusion_section_list_enabled" -eq 1 ]; then
             config=$(sing_box_cm_add_route_rule "$config" "$SB_EXCLUSION_RULE_TAG" "$SB_TPROXY_INBOUND_TAG" \
                 "$SB_DIRECT_OUTBOUND_TAG")
+            local enable_ipv6
+            config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+            if [ "$enable_ipv6" -eq 1 ]; then
+                config=$(sing_box_cm_add_route_rule "$config" "$SB_EXCLUSION_RULE_TAG" "$SB_TPROXY_INBOUND_TAG_IPv6" \
+                    "$SB_DIRECT_OUTBOUND_TAG")
+            fi
         else
             log "Exclusion sections does not have any enabled list, route rule is not required" "warn"
         fi
@@ -928,11 +1054,17 @@ configure_routing_for_section_lists() {
     config_get remote_subnet_lists "$section" "remote_subnet_lists"
     config_get section_connection_type "$section" "connection_type"
 
+    local enable_ipv6
+    config_get_bool enable_ipv6 "settings" "enable_ipv6" 0
+
     case "$section_connection_type" in
     proxy | vpn)
         route_rule_tag="$(gen_id)"
         outbound_tag=$(get_outbound_tag_by_section "$section")
         config=$(sing_box_cm_add_route_rule "$config" "$route_rule_tag" "$SB_TPROXY_INBOUND_TAG" "$outbound_tag")
+        if [ "$enable_ipv6" -eq 1 ]; then
+            config=$(sing_box_cm_add_route_rule "$config" "$route_rule_tag" "$SB_TPROXY_INBOUND_TAG_IPv6" "$outbound_tag")
+        fi
         ;;
     block)
         route_rule_tag="$SB_REJECT_RULE_TAG"
